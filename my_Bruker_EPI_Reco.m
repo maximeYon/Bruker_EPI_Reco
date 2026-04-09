@@ -9,7 +9,6 @@ clearvars; close all; clc;
 
 home_path = pwd; home_path = split(home_path,filesep);
 home_path = join(home_path(1:end-1,1),filesep,1); home_path = home_path{1};
-addpath(genpath([home_path filesep 'MATLABfunctions']));
 addpath(genpath('functions'));
 
 %% Data path

@@ -9,26 +9,34 @@ clearvars; close all; clc;
 
 home_path = pwd; home_path = split(home_path,filesep);
 home_path = join(home_path(1:end-1,1),filesep,1); home_path = home_path{1};
-addpath(genpath('functions'));
+% addpath(genpath('functions'));
+addpath('functions');
+addpath(genpath('pvtools'));
 
 %% Data path
 % expno_dir = 'C:\Users\User\Mon_Drive\Matlab\ProcessingPV360\data\EPI_test\9\';
-expno_dir = 'C:\Users\User\Mon_Drive\Matlab\ProcessingPV360\data\EPI_test\18\';
+% expno_dir = 'C:\Users\User\Mon_Drive\Matlab\ProcessingPV360\data\EPI_test\18\';
+% expno_dir = 'C:\Users\User\Mon_Drive\Matlab\ProcessingPV360\data\ON84_invivo3d\14\';
+expno_dir = 'C:\Users\User\Mon_Drive\Matlab\ProcessingPV360\data\Prostate15\12\';
+% expno_dir = 'E:\Documents\shared_folder\20230423_101023_ON_79_mtbi_pilot_3d_1_1\12\';
 
 do_pocs = 0;
+% navigator correction (echo time shifting: segment s starts PVM_EpiEchoShiftA(s) later)
+%   'fit'     = weighted linear fit of phase and log-amplitude of each full navigator (edges excluded)
+%               vs absolute time (sample time + EpiEchoShiftA), all segments evaluated at the same
+%               reference time -> works whatever the number of segments / overlap
+%   'aligned' = navigators compared sample by sample on the time window shared by all segments
+nav_mode = 'fit';
 
 %% retrieve Paravision version & import FID
 Param.PV_version = ReadPV360Param(expno_dir, 'ACQ_sw_version');
-if strcmp(Param.PV_version,'<pv 6.0.1>')
-    [~,fid] = readPV360Raw([expno_dir 'fid']);
+if isfile([expno_dir 'fid'])
+    [~,fid] = readPV360Raw([expno_dir 'fid']);           % PV <= 7
 else
-    [~,fid] = readPV360Raw([expno_dir 'rawdata.job0']);
+    [~,fid] = readPV360Raw([expno_dir 'rawdata.job0']);  % PV360
 end
 fid = squeeze(fid);
 Param.Npoints = numel(fid);
-
-% figure()
-% plot(abs(fid))
 
 %% get PV parameters
 Param = getPVparams(expno_dir,Param);
@@ -37,26 +45,66 @@ Param = getPVparams(expno_dir,Param);
 imageObj = ImageDataObject([expno_dir filesep, 'pdata', filesep, '1']);
 imgBruker = squeeze(imageObj.data);
 
-%% split navigator data
-if strcmp(Param.EpiPrefixNavYes,'yes')
-    if strcmp(Param.EpiSingleNav,'no')
-        Param.Nnav_rep = Param.NRepetitions * Param.NEchoImages*Param.NSegments*Param.NSlice;
-        fid = reshape(fid, numel(fid)/Param.Nnav_rep,Param.Nnav_rep);
-        Nav = fid(1:Param.EpiPrefixNavSize,:);
-        Nav = mean(abs(Nav(round(Param.EpiPrefixNavSize*0.1):round(Param.EpiPrefixNavSize*0.9),:))); % from 10 to 90%  arbitrary
-        if strcmp(Param.SpatDimEnum,'<2d>')
-            Param.total_rep = Param.NRepetitions * Param.NEchoImages;
-            Nav =  reshape(Nav,[1,1, Param.EncNReceivers, Param.NSlice, Param.NSegments,  Param.total_rep]);
-            Nav = permute(Nav,[1 2 5 4 6 3]);
-        end
-        if strcmp(Param.DoubleSampling,'yes')
-            echotrainSize = Param.EncMatrix(1,1).* Param.EncMatrix(1,2)./ Param.NSegments * 2; %last *2 is for Double sampling
-        else
-            echotrainSize = Param.EncMatrix(1,1).* Param.EncMatrix(1,2)./ Param.NSegments;
-        end
-        fid = fid(end-echotrainSize+1:end,:);
-        fid = fid(:);
+%% split navigator + navigator correction (RecoStabCorrFilter, drift=false)
+% amplitude & zero-order phase of each segment aligned to segment 1,
+% separately for each receiver / slice / repetition (or kz step in 3D)
+if strcmp(Param.EpiPrefixNavYes,'yes') && strcmp(Param.EpiSingleNav,'no')
+    scanSize = Param.ACQ_size(1)/2;   % complex points per scan: nav + junk + echo train
+    assert(mod(numel(fid), scanSize*Param.EncNReceivers*Param.NSlice*Param.NSegments)==0, 'Unexpected scan size');
+    % scan order: 2D [rx, slice, seg, rep...]  /  3D (NSlice=1) [rx, seg, kz, rep...]
+    fid = reshape(fid, scanSize, Param.EncNReceivers, Param.NSlice, Param.NSegments, []);
+    Nav = fid(1:Param.EpiPrefixNavSize,:,:,:,:);
+    if strcmp(Param.DoubleSampling,'yes')
+        echotrainSize = Param.EncMatrix(1,1).*Param.EncMatrix(1,2)./Param.NSegments*2; % *2 for double sampling
+    else
+        echotrainSize = Param.EncMatrix(1,1).*Param.EncMatrix(1,2)./Param.NSegments;
     end
+    fid = fid(end-echotrainSize+1:end,:,:,:,:);           % drop nav + junk
+    % timing of the navigator samples
+    dwNav = Param.EpiPrefixNavDur/Param.EpiPrefixNavSize;                  % ms per nav sample
+    A = zeros(1,Param.NSegments);                                          % start delay of each segment (ms)
+    if strcmpi(Param.EpiEchoTimeShifting,'yes') && numel(Param.EpiEchoShiftA)==Param.NSegments
+        A = Param.EpiEchoShiftA(:).';
+    end
+    navLo = 16; navHi = Param.EpiPrefixNavSize-6;                          % drop filter transients at both ends
+    switch nav_mode
+        case 'fit'
+            % phase(t) and log|nav(t)| fitted as a + b*(t - Tref) for each receiver/slice/segment/rep,
+            % t = absolute time after excitation. Weights |nav|^2 (variance of phase and log-amplitude
+            % ~ 1/|nav|^2). Tref = centre of the time span covered by all navigators; the intercept a
+            % is the value at Tref, so segments are compared at the same time.
+            n    = (navLo:navHi).';
+            Tref = ((navLo-1)*dwNav + min(A) + (navHi-1)*dwNav + max(A))/2;
+            t    = (n-1)*dwNav + reshape(A,1,1,1,[]) - Tref;                % [Nn 1 1 NSeg]
+            Y    = Nav(n,:,:,:,:);
+            w    = abs(Y).^2;
+            S0 = sum(w,1); S1 = sum(w.*t,1); S2 = sum(w.*t.^2,1); den = S0.*S2 - S1.^2;
+            atTref = @(y) (S2.*sum(w.*y,1) - S1.*sum(w.*t.*y,1))./den;     % weighted LS intercept
+            phT = atTref(unwrap(angle(Y),[],1));
+            laT = atTref(log(abs(Y)+realmin));
+            navPhase = angle(exp(1i*(phT(:,:,:,1,:) - phT)));            % segment 1 = reference
+            navAmp   = exp(laT(:,:,:,1,:) - laT);
+            clearvars Y w t S0 S1 S2 den phT laT
+        case 'aligned'
+            % nav sample n of segment s is at the same time as sample n+sh(s) of segment 1:
+            % compare segments only on the time window they all share
+            sh = round((A - A(1))/dwNav);
+            u  = (navLo+max(sh)):(navHi+min(sh));                          % common window, segment-1 time base
+            assert(numel(u)>=20, 'Navigator window common to all segments is too short (%d samples), use nav_mode = ''fit''', numel(u));
+            NavAl = zeros([numel(u) size(Nav,2) size(Nav,3) size(Nav,4) size(Nav,5)], 'like', Nav);
+            for s = 1:Param.NSegments
+                NavAl(:,:,:,s,:) = Nav(u-sh(s),:,:,s,:);
+            end
+            Nav = NavAl; clearvars NavAl
+            NavRef   = Nav(:,:,:,1,:);                    % segment 1 = reference
+            navAmp   = sqrt(sum(abs(NavRef).^2,1)./sum(abs(Nav).^2,1));
+            navPhase = angle(sum(NavRef.*conj(Nav),1));
+        otherwise
+            error('Unknown nav_mode ''%s''', nav_mode);
+    end
+    fid = fid.*(navAmp.*exp(1i*navPhase));                % segment 1 -> factor 1
+    fid = fid(:);
+    clearvars Nav NavRef
 end
 
 %% fid reshape
@@ -72,38 +120,12 @@ if strcmp(Param.SpatDimEnum,'<2d>')
         fid = reshape(fid,[Param.EncMatrix(1,1), 2, Param.EncMatrix(1,2)/Param.NSegments, Param.EncNReceivers, Param.NSlice, Param.NSegments,  Param.total_rep]);
         fid = permute(fid,[1 3 6 5 7 2 4]);
 
-        % Navigator correction of 2 segments acquisition
-        if strcmp(Param.EpiPrefixNavYes,'yes')
-            if strcmp(Param.EpiSingleNav,'no')
-                nav_norm = Nav(:,:,1,:,:,:)./Nav(:,:,2,:,:,:);
-                fid(:,:,2,:,:,:) =fid(:,:,2,:,:,:).*repmat(nav_norm,size(fid,1),size(fid,2),1,1,1,2);
-            end
-        end
     else
         New_readout_size = size(fid,1)/((Param.EncMatrix(1,2)/Param.NSegments)*Param.EncNReceivers*Param.NSlice*Param.NSegments*Param.total_rep);
         Param.EncMatrix(1,1) = New_readout_size;% for ramp sampling compensation cases
         fid = reshape(fid,[Param.EncMatrix(1,1), Param.EncMatrix(1,2)/Param.NSegments, Param.EncNReceivers, Param.NSlice, Param.NSegments, Param.total_rep]);
         fid = permute(fid,[1 2 5 4 6 3]); %dim1 dim2 NSegments dim3 rep 1 receivers, might need special case for Nslice =1
     end
-    % %% correction of EpiEchoShift, not working
-    %     % RecoStabCorrFilter NAV0{innerSegments=1;navSize=0;echoSize=96;nEchoes=12;junkSize=0;nSlices=<NI>;nSegments=<PVM_EpiNShots>;sliding=true;useNav=true;dc=false;select=0;drift=false;dyncor=0;junkSize0=0;navSize2=0;multiecho=1};
-    %     ind_odd = 1:2:size(fid,2);
-    %     ind_even = 2:2:size(fid,2);
-    %     x= linspace(-0.5, 0.5,size(fid,1));
-    %     % How to use Param.EpiEchoShiftA Param.EpiEchoShiftB ?
-    %         for ind_seg = 1:size(fid,3)
-    %         % --- scaling  ---
-    %         delta_k1 = Param.EpiEchoShiftB(ind_seg) * size(fid,1) / (4*pi);
-    %         delta_k2 = Param.EpiEchoShiftA(ind_seg) * size(fid,1) / (4*pi);
-    %
-    %         % Phase ramps
-    %         corrpos = exp(-1i * 2*pi * delta_k1 * x)';
-    %         corrneg = exp(-1i * 2*pi * delta_k2 * x)';
-    %
-    %         fid(:,ind_odd,ind_seg,:,:,:) = fid(:,ind_odd,ind_seg,:,:,:).*repmat(corrpos,1,numel(ind_odd),1,size(fid,4),size(fid,5),size(fid,6));
-    %         fid(:,ind_even,ind_seg,:,:,:) = fid(:,ind_even,ind_seg,:,:,:).*repmat(corrneg,1,numel(ind_even),1,size(fid,4),size(fid,5),size(fid,6));
-    %         end
-    %     %% End of correction of EpiEchoShift
 
     if strcmp(Param.DoubleSampling,'no')
         %% use dim5 to store odd and even echoes
@@ -119,33 +141,15 @@ if strcmp(Param.SpatDimEnum,'<2d>')
     end
 
     %% regridding
-    [fid] = my_EPI_reconX_trapezoid_compute_apply(fid,Param);
+    if strcmp(Param.DoubleSampling,'yes')
+        polDim = 6; % [read, lines/seg, seg, slice, rep, DS, rx]
+    else
+        polDim = 5; % odd/even echoes stored in dim 5
+    end
+    [fid] = my_EPI_reconX_trapezoid_compute_apply(fid,Param,polDim);
 
     if strcmp(Param.DoubleSampling,'no')
-        %% ghost correction : might not match exactly the Bruker one
-        % RecoEpiGhostFilter EG0{innerSegments=1;nechoes=64;phc=<PVM_EpiPhaseCorrection[0]>;nslices=<NI>;adjust=0;refecho=33;time=true;center=<PVM_EpiReadCenter>;channel=0;maxorder=1;doubleshotadj=0;dyncor=0;usedyn=1};
-        disp('Ghost correction')
-        [~,center_coordinate] = min(abs(Param.EpiTrajAdjkx-Param.EpiReadCenter));
-        center_coordinate = center_coordinate/size(fid,1)-0.5;
-        x= linspace(-0.5, 0.5,size(fid,1))+center_coordinate;
-
-        for ind_slice = 1:size(fid,4)
-            epiCorr_all =Param.EpiPhaseCorrection(1,:);
-            epiCorr_all = reshape(epiCorr_all,2,size(fid,4));
-            epiCorr = epiCorr_all(:,ind_slice);
-
-            % --- scaling  ---
-            delta_k1 = epiCorr(1) * size(fid,1) / (4*pi) / Param.NSegments; % / NSegments does not make sense
-            delta_k2 = epiCorr(2) * size(fid,1) / (4*pi) / Param.NSegments;
-
-            % Phase ramps
-            corrpos = exp(-1i * 2*pi * delta_k1 * x)';
-            corrneg = exp(-1i * 2*pi * delta_k2 * x)';
-
-            fid(:,:,:,ind_slice,1,:,:) = FFTXSpace2KSpace(FFTKSpace2XSpace(fid(:,:,:,ind_slice,1,:,:),1).*repmat(corrpos,1,size(fid,2),size(fid,3),1,1,size(fid,6),size(fid,7)),1);
-            fid(:,:,:,ind_slice,2,:,:) = FFTXSpace2KSpace(FFTKSpace2XSpace(fid(:,:,:,ind_slice,2,:,:),1).*repmat(corrneg,1,size(fid,2),size(fid,3),1,1,size(fid,6),size(fid,7)),1);
-        end
-
+        % (ghost correction RecoEpiGhostFilter is done inside the regridding)
         %% re-create correct dim 2 by combining odd and even echoes
         fid = permute(fid,[1 5 2 3 4 6 7]);
         fid = reshape(fid,size(fid,1),size(fid,2)*size(fid,3),size(fid,4),size(fid,5),size(fid,6),size(fid,7)); % combine odd even
@@ -155,15 +159,17 @@ if strcmp(Param.SpatDimEnum,'<2d>')
         end
     end
 
-    %% combine segments
-    fid = reshape(fid,size(fid,1),size(fid,2)*size(fid,3),size(fid,4),size(fid,5),size(fid,6));
-    fid(:,Param.EncSteps1_pos,:,:,:) = fid;
-    fid(:,:,Param.SliceOrder,:,:) = fid;
+    %% combine segments (all other dimensions kept: slice, rep, [DS], rx)
+    sz = size(fid); sz(end+1:7) = 1;
+    fid = reshape(fid,[sz(1) sz(2)*sz(3) sz(4:end)]);      % [read, phase, slice, rep, (DS), rx]
+    fid(:,Param.EncSteps1_pos,:) = fid(:,:,:);
+    fid(:,:,Param.SliceOrder,:) = fid(:,:,:,:);
 
     %% Zero filling Partial FT reco
-    fidZF = zeros(size(fid,1),Param.Matrix(1,2),size(fid,3),size(fid,4),size(fid,5));
+    szZF = size(fid); szZF(2) = Param.Matrix(1,2);
+    fidZF = zeros(szZF);
     Nline = Param.Matrix(1,2)-size(fid,2);
-    fidZF(:,Nline+1:end,:,:,:) = fid;
+    fidZF(:,Nline+1:end,:) = fid(:,:,:);
 
     %% POCS
     if do_pocs ==1
@@ -188,25 +194,6 @@ else
         fid = reshape(fid,[Param.EncMatrix(1,1), 1, Param.EncMatrix(1,2)/Param.NSegments, Param.EncNReceivers, Param.NSegments,  Param.EncMatrix(1,3), Param.total_rep ]);
         fid = permute(fid,[1 3 5 6 7 2 4]); %dim1 dim2 NSegments dim3 rep 1 receivers
     end
-    % %% correction of EpiEchoShift , not working
-    %     % RecoStabCorrFilter NAV0{innerSegments=1;navSize=0;echoSize=96;nEchoes=12;junkSize=0;nSlices=<NI>;nSegments=<PVM_EpiNShots>;sliding=true;useNav=true;dc=false;select=0;drift=false;dyncor=0;junkSize0=0;navSize2=0;multiecho=1};
-    %     ind_odd = 1:2:size(fid,2);
-    %     ind_even = 2:2:size(fid,2);
-    %     x= linspace(-0.5, 0.5,size(fid,1));
-    %     % How to use Param.EpiEchoShiftA Param.EpiEchoShiftB ?
-    %         for ind_seg = 1:size(fid,3)
-    %         % --- scaling  ---
-    %         delta_k1 = Param.EpiEchoShiftA(ind_seg) * size(fid,1) / (4*pi);
-    %         delta_k2 = Param.EpiEchoShiftB(ind_seg) * size(fid,1) / (4*pi);
-    %
-    %         % Phase ramps
-    %         corrpos = exp(-1i * 2*pi * delta_k1 * x)';
-    %         corrneg = exp(-1i * 2*pi * delta_k2 * x)';
-    %
-    %         fid(:,ind_odd,ind_seg,:,:,:) = fid(:,ind_odd,ind_seg,:,:,1).*repmat(corrpos,1,numel(ind_odd),1,size(fid,4),size(fid,5),size(fid,6));
-    %         fid(:,ind_even,ind_seg,:,:,:) = fid(:,ind_even,ind_seg,:,:,2).*repmat(corrneg,1,numel(ind_even),1,size(fid,4),size(fid,5),size(fid,6));
-    %         end
-    %     %% End of correction of EpiEchoShift
 
     if strcmp(Param.DoubleSampling,'no')
         %% use dim5 to store odd and even echoes
@@ -225,237 +212,154 @@ else
     end
 
     %% regridding
-    [fid] = my_EPI_reconX_trapezoid_compute_apply(fid,Param);
+    if strcmp(Param.DoubleSampling,'yes')
+        polDim = 6; % [read, lines/seg, seg, dim3, rep, DS, rx]
+    else
+        polDim = 5; % odd/even echoes stored in dim 5
+    end
+    [fid] = my_EPI_reconX_trapezoid_compute_apply(fid,Param,polDim);
+
+    % (ghost correction RecoEpiGhostFilter is done inside the regridding)
 
     if strcmp(Param.DoubleSampling,'no')
-        %% ghost correction : might not match exactly the Bruker one
-        disp('Ghost correction')
-        [~,center_coordinate] = min(abs(Param.EpiTrajAdjkx-Param.EpiReadCenter));
-        center_coordinate = center_coordinate/size(fid,1)-0.5;
-        x= linspace(-0.5, 0.5,size(fid,1))+center_coordinate;
-        coord_PhaseCorr = [1 2];
-        epiCorr = Param.EpiPhaseCorrection(1,coord_PhaseCorr);
+        %% re-create correct dim 2 by combining odd and even echoes
+        fid = permute(fid,[1 5 2 3 4 6 7]);
+        fid = reshape(fid,size(fid,1),size(fid,2)*size(fid,3),size(fid,4),size(fid,5),size(fid,6),size(fid,7)); % combine odd even
 
-        % --- scaling  ---
-        delta_k1 = epiCorr(1) * size(fid,1) / (4*pi) / Param.NSegments; % / NSegments does not make sense
-        delta_k2 = epiCorr(2) * size(fid,1) / (4*pi) / Param.NSegments; % / NSegments does not make sense
-
-        % Phase ramps
-        corrpos = exp(-1i * 2*pi * delta_k1 * x)';
-        corrneg = exp(-1i * 2*pi * delta_k2 * x)';
-
-        fid(:,:,:,:,1,:,:) = FFTXSpace2KSpace(FFTKSpace2XSpace(fid(:,:,:,:,1,:,:),1).*repmat(corrpos,1,size(fid,2),size(fid,3),size(fid,4),1,size(fid,6),size(fid,7)),1);
-        fid(:,:,:,:,2,:,:) = FFTXSpace2KSpace(FFTKSpace2XSpace(fid(:,:,:,:,2,:,:),1).*repmat(corrneg,1,size(fid,2),size(fid,3),size(fid,4),1,size(fid,6),size(fid,7)),1);
+        if add_line_to_even ==1
+            fid = fid(:,1:end-1,:,:,:,:);
+        end
     end
 
-    %% re-create correct dim 2 by combining odd and even echoes
-    fid = permute(fid,[1 5 2 3 4 6 7]);
-    fid = reshape(fid,size(fid,1),size(fid,2)*size(fid,3),size(fid,4),size(fid,5),size(fid,6),size(fid,7)); % combine odd even
-
-    if add_line_to_even ==1
-        fid = fid(:,1:end-1,:,:,:,:);
-    end
-
-
-    fid = reshape(fid,size(fid,1),size(fid,2)*size(fid,3),size(fid,4),size(fid,5),size(fid,6),size(fid,7)); % combine segments
+    fid = reshape(fid,size(fid,1),size(fid,2)*size(fid,3),size(fid,4),size(fid,5),size(fid,6),size(fid,7)); % combine segments -> [read, phase, kz, rep, (DS), rx]
     fid(:,Param.EncSteps1_pos,:,:,:,:) = fid;
 
-    %% Zero filling Partial FT reco
-    fidZF = zeros(size(fid,1),Param.Matrix(1,2),size(fid,3),size(fid,4),size(fid,5),size(fid,6));
+    %% Zero filling Partial FT reco (phase) + kz placement from PVM_EncSteps2 (acquisition order, partial FT in kz)
+    kzPos = Param.EncSteps2(:).' + floor(Param.Matrix(1,3)/2) + 1;    % kz = 0 at floor(N/2) (0-based), as for ky
+    assert(numel(kzPos)==size(fid,3) && all(kzPos>=1 & kzPos<=Param.Matrix(1,3)), ...
+        'PVM_EncSteps2 (%d steps) does not match the kz dimension (%d) / matrix (%d)', numel(kzPos), size(fid,3), Param.Matrix(1,3));
+    szZF = size(fid); szZF(end+1:6) = 1;
+    szZF(2) = Param.Matrix(1,2); szZF(3) = Param.Matrix(1,3);
+    fidZF = zeros(szZF);
     Nline = Param.Matrix(1,2)-size(fid,2);
-    fidZF(:,Nline+1:end,:,:,:,:) = fid;
+    fidZF(:,Nline+1:end,kzPos,:) = fid(:,:,:,:);
 end
 clearvars fid;
 
-% reshape if Nslice == 1
-if Param.NSlice ==1 && numel(size(fidZF))==5 && strcmp(Param.SpatDimEnum,'<2d>')==1
-    fidZF = reshape(fidZF,size(fidZF,1),size(fidZF,2),1,size(fidZF,3),size(fidZF,4),size(fidZF,5));
-end
+%% receivers: Paravision RecoScaleFilter per channel (scale + constant phase offset)
+% layout of fidZF: [read, phase, slice|kz, rep, (DS), rx]
+if strcmp(Param.DoubleSampling,'yes'), rxDim = 6; else, rxDim = 5; end
+chanFactor = Param.RecoScaleChan(:).*exp(1i*pi/180*Param.RecoPhaseChan(:));
+assert(numel(chanFactor)==Param.EncNReceivers, 'RecoScaleChan/RecoPhaseChan do not match PVM_EncNReceivers');
+assert(size(fidZF,rxDim)==Param.EncNReceivers, 'Receiver dimension %d has size %d, expected %d', rxDim, size(fidZF,rxDim), Param.EncNReceivers);
+fidZF = fidZF.*reshape(chanFactor, [ones(1,rxDim-1) numel(chanFactor)]);
 
-% apply scaling on coils
-for ind_coil = 1:Param.EncNReceivers
-    if numel(size(fidZF))==5
-        fidZF(:,:,:,:,ind_coil) = fidZF(:,:,:,:,ind_coil).*Param.RecoScaleChan(ind_coil);
-    end
-    if numel(size(fidZF))==6
-        fidZF(:,:,:,:,:,ind_coil) = fidZF(:,:,:,:,:,ind_coil).*Param.RecoScaleChan(ind_coil);
-    end
-end
-
-% apply phase offset between receivers
-if Param.EncNReceivers > 1
-    for ind_coil = 1:Param.EncNReceivers
-        phase_mat{ind_coil} = -(1.*exp(1i*pi*(Param.RecoPhaseChan(ind_coil)/180)*(0:1/(size(fidZF,1)-1):1)))';
-
-        if numel(size(fidZF))==5
-            phase_mat{ind_coil} = repmat(phase_mat{ind_coil},1,size(fidZF,2),size(fidZF,3),size(fidZF,4),1);
-            fidZF(:,:,:,:,ind_coil) = fidZF(:,:,:,:,ind_coil).*phase_mat{ind_coil};
-        end
-        if numel(size(fidZF))==6
-            phase_mat{ind_coil} = repmat(phase_mat{ind_coil},1,size(fidZF,2),size(fidZF,3),size(fidZF,4),size(fidZF,5),1);
-            fidZF(:,:,:,:,:,ind_coil) = fidZF(:,:,:,:,:,ind_coil).*phase_mat{ind_coil};
-        end
-    end
-end
-
-% apply phase shift for position correction
-dims=[size(fidZF,1), size(fidZF,2), size(fidZF,3), size(fidZF,4), size(fidZF,5), size(fidZF,5)];
-Offset_in_pixel = zeros(3,1);
-Offset_in_pixel(2,1) =Param.Read_offset/(Param.FoV(1,1)).*((Param.Matrix(1,1)));
-Offset_in_pixel(2,1) =-Param.Phase_1offset/(Param.FoV(1,2)).*((Param.Matrix(1,2)));
-if strcmp(Param.SpatDimEnum,'<3d>')
-    Offset_in_pixel(3,1) =-Param.Phase_1offset/(Param.FoV(1,3)).*((Param.Matrix(1,3)));
-end
-
-
-phase_matrix=ones(size(fidZF));
-if strcmp(Param.DoubleSampling,'yes')
+%% Fourier transform, reproducing Paravision orientation and position shifts
+% read (dim 1): exact inverse of the k-space transform at the end of the regridding.
+%   The position (RECO_offset, RECO_rotate) is already in the regridding grid.
+imgCmp = ifftshift(ifft(ifftshift(fidZF,1),[],1),1);                 % Paravision scale (see fftscale in the regridding)
+% phase (dim 2) [and slab (dim 3) in 3D]: RecoFTShiftFilter with RECO_rotate + RecoFTFilter (exponent +1)
+%   RECO_rotate=0.5 is the centring, other values add the off-centre shift. The ramp uses a signed
+%   k index (ky=0 at floor(N/2)) + ifftshift: same magnitude as Paravision, no (-1)^n phase checkerboard.
+%   ifft includes the 1/N normalisation of Paravision's inverse FT (RecoFTFilter exponent +1).
+ftDims = 2;
+if strcmp(Param.SpatDimEnum,'<3d>'), ftDims = [2 3]; end
+for d = ftDims
+    N   = size(imgCmp,d);
+    rot = Param.RecoRotate(d,:);                % one value per frame, acquisition order
     if strcmp(Param.SpatDimEnum,'<2d>')
-        for Offset_dim = 2:2 % shift in dim 1 is included in gridding
-            f=0:1/(dims(Offset_dim)):1-(1/(dims(Offset_dim)));
-            phase_vector=exp(1i*2*pi*Offset_in_pixel(Offset_dim)*f);
-            switch Offset_dim
-                case 1
-                    phase_matrix=phase_matrix.*repmat(phase_vector, [1, dims(2), dims(3), dims(4), dims(5), dims(6)]);
-                case 2
-                    phase_matrix=phase_matrix.*repmat(phase_vector, [dims(1), 1, dims(3), dims(4), dims(5), dims(6)]);
-            end
-        end
+        rot(Param.SliceOrder) = rot;            % same slice reordering as the data
+        rot = reshape(rot,1,1,[]);              % slices are in dim 3
     end
-
-    if strcmp(Param.SpatDimEnum,'<3d>')
-        for Offset_dim = 2:3 % shift in dim 1 is included in gridding
-            f=0:1/(dims(Offset_dim)):1-(1/(dims(Offset_dim)));
-            phase_vector=exp(1i*2*pi*Offset_in_pixel(Offset_dim)*f);
-            switch Offset_dim
-                case 1
-                    phase_matrix=phase_matrix.*repmat(phase_vector, [1, dims(2), dims(3), dims(4), dims(5), dims(6)]);
-                case 2
-                    phase_matrix=phase_matrix.*repmat(phase_vector, [dims(1), 1, dims(3), dims(4), dims(5), dims(6)]);
-                case 3
-                    phase_matrix=phase_matrix.*repmat(permute(phase_vector,[1 3 2]), [dims(1), dims(2),1 , dims(4), dims(5), dims(6)]);
-            end
-        end
-    end
-    fidZF = fidZF.*phase_matrix;
-else
-    if strcmp(Param.SpatDimEnum,'<2d>')
-        for Offset_dim = 2:2 % shift in dim 1 is included in gridding
-            f=0:1/(dims(Offset_dim)):1-(1/(dims(Offset_dim)));
-            phase_vector=exp(1i*2*pi*Offset_in_pixel(Offset_dim)*f);
-            switch Offset_dim
-                case 1
-                    phase_matrix=phase_matrix.*repmat(phase_vector, [1, dims(2), dims(3), dims(4), dims(5)]);
-                case 2
-                    phase_matrix=phase_matrix.*repmat(phase_vector, [dims(1), 1, dims(3), dims(4), dims(5)]);
-            end
-        end
-    end
-
-    if strcmp(Param.SpatDimEnum,'<3d>')
-        for Offset_dim = 2:3 % shift in dim 1 is included in gridding
-            f=0:1/(dims(Offset_dim)):1-(1/(dims(Offset_dim)));
-            phase_vector=exp(1i*2*pi*Offset_in_pixel(Offset_dim)*f);
-            switch Offset_dim
-                case 1
-                    phase_matrix=phase_matrix.*repmat(phase_vector, [1, dims(2), dims(3), dims(4), dims(5)]);
-                case 2
-                    phase_matrix=phase_matrix.*repmat(phase_vector, [dims(1), 1, dims(3), dims(4), dims(5)]);
-                case 3
-                    phase_matrix=phase_matrix.*repmat(permute(phase_vector,[1 3 2]), [dims(1), dims(2),1 , dims(4), dims(5)]);
-            end
-        end
-    end
-    fidZF = fidZF.*phase_matrix;
-end
-
-% Fourier transform
-if strcmp(Param.SpatDimEnum,'<2d>')
-    imgCmp= FFTKSpace2XSpace(FFTKSpace2XSpace(fidZF,1),2);
-else
-    imgCmp= FFTKSpace2XSpace(FFTKSpace2XSpace(FFTKSpace2XSpace(fidZF,1),2),3);
+    kc = reshape((0:N-1) - floor(N/2), [ones(1,d-1) N]);   % signed k index, ky=0 at floor(N/2)
+    imgCmp = ifft(ifftshift(imgCmp.*exp(-1i*2*pi*rot.*kc), d), [], d);     % same values as Paravision, smooth phase
 end
 
 %% display
-nrep_disp =1;
-slice_disp =round(size(fidZF,3)/2);
-if strcmp(Param.DoubleSampling,'yes')
-    if Param.EncNReceivers >1
-        figure(2)
-        subplot(2,4,1)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1,1)))
-        subplot(2,4,4+1)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1,1)))
-        subplot(2,4,2)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,2,1)))
-        subplot(2,4,4+2)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,2,1)))
-        subplot(2,4,3)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1,2)))
-        subplot(2,4,4+3)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1,2)))
-        subplot(2,4,4)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,2,2)))
-        subplot(2,4,4+4)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,2,2)))
-        linkaxes
+for nrep_disp = 1:2:min(20,size(imgCmp,4))
+    % nrep_disp =1;
+    slice_disp =round(size(fidZF,3)/2);
+    if strcmp(Param.DoubleSampling,'yes')
+        if Param.EncNReceivers >1
+            figure(2)
+            subplot(2,4,1)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1,1)))
+            subplot(2,4,4+1)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1,1)))
+            subplot(2,4,2)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,2,1)))
+            subplot(2,4,4+2)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,2,1)))
+            subplot(2,4,3)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1,2)))
+            subplot(2,4,4+3)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1,2)))
+            subplot(2,4,4)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,2,2)))
+            subplot(2,4,4+4)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,2,2)))
+            linkaxes
+        else
+            figure(2)
+            subplot(2,4,1)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1,1)))
+            subplot(2,4,4+1)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1,1)))
+            subplot(2,4,2)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,2,1)))
+            subplot(2,4,4+2)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,2,1)))
+            linkaxes
+        end
     else
-        figure(2)
-        subplot(2,4,1)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1,1)))
-        subplot(2,4,4+1)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1,1)))
-        subplot(2,4,2)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,2,1)))
-        subplot(2,4,4+2)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,2,1)))
-        linkaxes
+        if Param.EncNReceivers >1
+            figure(2)
+            subplot(2,2,1)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1)))
+            subplot(2,2,2)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1)))
+            subplot(2,2,3)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,2)))
+            subplot(2,2,4)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,2)))
+            linkaxes
+        else
+            figure(2)
+            subplot(2,1,1)
+            imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1)))
+            subplot(2,1,2)
+            imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1)))
+            linkaxes
+        end
     end
-else
-    if Param.EncNReceivers >1
-        figure(2)
-        subplot(2,2,1)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1)))
-        subplot(2,2,2)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1)))
-        subplot(2,2,3)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,2)))
-        subplot(2,2,4)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,2)))
-        linkaxes
-    else
-        figure(2)
-        subplot(2,1,1)
-        imagesc(abs(imgCmp(:,:,slice_disp,nrep_disp,1)))
-        subplot(2,1,2)
-        imagesc(angle(imgCmp(:,:,slice_disp,nrep_disp,1)))
-        linkaxes
-    end
+
+    drawnow
+        pause(1)
 end
 
+img_abs = sqrt(sum(abs(imgCmp).^2, rxDim));     % RecoSumOfSquaresFilter over receivers (= abs for 1 receiver)
 if strcmp(Param.DoubleSampling,'yes')
-    img_abs = sum(sqrt(abs(imgCmp.^2)),5); % sum over double sampling
-else
-    img_abs = abs(imgCmp); % abs
-end
-
-if Param.EncNReceivers > 1
-    img_abs = sum(sqrt(abs(img_abs.^2)),6); % sum over coils
+    img_abs = mean(img_abs, 5);                 % Paravision: (|pos| + |neg|)/2
 end
 
 %% Display
 slice_disp =round(size(fidZF,3)/2);
 figure(3)
-subplot(1,3,1)
+subplot(1,4,1)
 imagesc(squeeze(abs(fidZF(:,:,slice_disp,1,1,1))))
 title('Matlab k-space')
-subplot(1,3,2)
+subplot(1,4,2)
 imagesc(img_abs(:,:,slice_disp,1,1,1));
 title('Matlab image')
-subplot(1,3,3)
-% imagesc(flip(flip(imgBruker(:,:,slice_disp,1),1),2)')
-imagesc(flip(flip(imgBruker(:,:,slice_disp,1),1),2))
+imgPV = imgBruker(:,:,slice_disp,1);
+if Param.RecoTransposition(1)==1, imgPV = imgPV.'; end   % 2dseq stored [phase, read]
+subplot(1,4,3)
+imagesc(imgPV)
+% imagesc(flip(flip(imgBruker(:,:,slice_disp,1),1),2))
 title('Paravision image')
+subplot(1,4,4)
+imagesc(imgPV-img_abs(:,:,slice_disp,1))
+title('difference')
 colormap gray
 
 
@@ -472,6 +376,7 @@ Param.NEchoImages = ReadPV360Param(expno_dir, 'PVM_NEchoImages') ;
 Param.NSegments = ReadPV360Param(expno_dir, 'NSegments') ;
 Param.ObjOrderList = ReadPV360Param(expno_dir, 'PVM_ObjOrderList') ;
 Param.DwNDiffExp = ReadPV360Param(expno_dir, 'PVM_DwNDiffExp') ;
+Param.ACQ_size = ReadPV360Param(expno_dir, 'ACQ_size') ; % [2*complex points per scan, ...]
 %Receivers
 Param.EncNReceivers = ReadPV360Param(expno_dir, 'PVM_EncNReceivers') ;
 Param.EncChanScaling = ReadPV360Param(expno_dir, 'PVM_EncChanScaling') ;
@@ -486,6 +391,7 @@ Param.EffSliceOffset = ReadPV360Param([expno_dir filesep], 'PVM_EffSliceOffset')
 Param.FoV = ReadPV360Param([expno_dir filesep], 'PVM_Fov') ;
 Param.EncSteps1 = ReadPV360Param([expno_dir filesep], 'PVM_EncSteps1') ;
 Param.EncSteps1_pos = Param.EncSteps1+abs(min(Param.EncSteps1))+1;
+Param.EncSteps2 = ReadPV360Param([expno_dir filesep], 'PVM_EncSteps2') ; % kz encoding steps (3D), acquisition order
 Param.PVM_SpatResol = ReadPV360Param([expno_dir filesep], 'PVM_SpatResol') ;
 Param.PVM_SliceThick = ReadPV360Param([expno_dir filesep], 'PVM_SliceThick') ;
 %Options
@@ -497,184 +403,109 @@ Param.SliceOrder = ReadPV360Param(expno_dir, 'PVM_ObjOrderList')+1 ;
 Param.EpiPrefixNavYes = ReadPV360Param(expno_dir, 'PVM_EpiPrefixNavYes') ;
 Param.EpiSingleNav = ReadPV360Param(expno_dir, 'PVM_EpiSingleNav') ;
 Param.EpiPrefixNavSize = ReadPV360Param(expno_dir, 'PVM_EpiPrefixNavSize') ;
+Param.EpiPrefixNavDur = ReadPV360Param(expno_dir, 'PVM_EpiPrefixNavDur') ;     % ms
+Param.EpiEchoTimeShifting = ReadPV360Param(expno_dir, 'PVM_EpiEchoTimeShifting') ;
 
 % combination
 Param.RecoScaleChan = ReadPVParamRECO([expno_dir 'pdata' filesep '1' filesep], 'RecoScaleChan') ;
 Param.RecoPhaseChan = ReadPVParamRECO([expno_dir 'pdata' filesep '1' filesep], 'RecoPhaseChan') ;
 Param.EpiPhaseCorrection = ReadPVParamRECO([expno_dir 'pdata' filesep '1' filesep], 'PVM_EpiPhaseCorrection') ;
+% Paravision FT shift / cutoff (rows = FT dims, columns = frames in acquisition order)
+Param.RecoRotate = ReadPVParamRECO([expno_dir 'pdata' filesep '1' filesep], 'RECO_rotate') ;
+Param.RecoOffset = ReadPVParamRECO([expno_dir 'pdata' filesep '1' filesep], 'RECO_offset') ;
+Param.RecoSize   = ReadPVParamRECO([expno_dir 'pdata' filesep '1' filesep], 'RECO_size') ;
+Param.RecoFtSize = ReadPVParamRECO([expno_dir 'pdata' filesep '1' filesep], 'RECO_ft_size') ;
+Param.RecoTransposition = ReadPVParamRECO([expno_dir 'pdata' filesep '1' filesep], 'RECO_transposition') ;
 
 % trajectories
 Param.EpiTrajAdjkx = ReadPV360Param(expno_dir, 'PVM_EpiTrajAdjkx') ;
 Param.EpiReadCenter = ReadPV360Param(expno_dir, 'PVM_EpiReadCenter') ;
+Param.EpiReadCenterPV = Param.EpiReadCenter; % raw value (index of k=0 in the regridded readout), empty in PV6
+Param.EpiTrajAdjb0 = ReadPV360Param(expno_dir, 'PVM_EpiTrajAdjb0') ; % measured trajectory phase (regridding)
 Param.EpiReadAsym = ReadPV360Param(expno_dir, 'PVM_EpiReadAsym') ;
 if isempty(Param.EpiReadCenter)==1
     Param.EpiReadCenter = round(size(Param.EpiTrajAdjkx,2)/2)-size(Param.EpiTrajAdjkx,2)*Param.EpiReadAsym;
 end
 
 Param.EpiPhaseCorrection = ReadPV360Param(expno_dir, 'PVM_EpiPhaseCorrection') ;
-Param.EpiEchoShiftA = ReadPV360Param(expno_dir, 'PVM_EpiEchoShiftA') ;
+Param.EpiEchoShiftA = ReadPV360Param(expno_dir, 'PVM_EpiEchoShiftA') ; % echo time shifting: delay before nav + echo train, per segment (ms)
 Param.EpiEchoShiftB = ReadPV360Param(expno_dir, 'PVM_EpiEchoShiftB') ;
 
 
-%Smotting of the trajectory
-xTraj = (1:size(Param.EpiTrajAdjkx,2));
-xqTraj = -4:size(Param.EpiTrajAdjkx,2)+5;
-EpiTrajAdjkxPChip = pchip(xTraj,Param.EpiTrajAdjkx,xqTraj);
-[~,Values] = spaps(xqTraj,EpiTrajAdjkxPChip,0.1);% 0.3
-Param.EpiTrajAdjkxSodd = Values(1,6:end-5);
-Param.EpiTrajAdjkxSeven = Param.EpiTrajAdjkxSodd(end)-(Param.EpiTrajAdjkxSodd);
-
-% figure();
-% plot(diff(Param.EpiTrajAdjkx),'k');hold on;
-% plot(diff(Param.EpiTrajAdjkxSodd),'r');hold off;
-% figure();
-% plot([diff(Param.EpiTrajAdjkxSodd) diff(Param.EpiTrajAdjkxSeven)]);
 end
 
-function [fidR] = my_EPI_reconX_trapezoid_compute_apply(fid,Param)
-%UNTITLED Summary of this function goes here
-%   Detailed explanation goes here
+function [fidR] = my_EPI_reconX_trapezoid_compute_apply(fid,Param,polDim)
+% Regrids the EPI readout (dim 1) with the positive / negative trajectory operators.
+% polDim : dimension holding the readout polarity (index 1 = positive, 2 = negative).
+%          All other dimensions (segments, slices, reps, receivers...) are arbitrary.
 
-maxK = round(max(Param.EpiTrajAdjkxSodd));
+% Paravision RecoRegridFilter (rampForm=5), identified exactly on a Paravision fidRegrid file:
+%   out(j) = sum_t s(t) * sinc(k_t - j) * cos^2(pi*(k_t - j)/10) * [|k_t - j| < 5] * dk/dt(t)
+%   k_t = PVM_EpiTrajAdjkx (ktraject), j = 0..Nk-1, Nk = floor(max(k_t))+1, dk/dt = gradient(k_t)
+%   positive echoes * exp(-i*b0), negative echoes * exp(+i*(b0 - b0(end))) (b0traject = PVM_EpiTrajAdjb0),
+%   negative echoes regridded with the same forward trajectory, then reversed (RecoReverseFilter).
+traj = Param.EpiTrajAdjkx(:);                        % raw measured trajectory (as Paravision)
+numSamples = numel(traj);
+assert(size(fid,1)==numSamples, 'Readout has %d points but PVM_EpiTrajAdjkx has %d', size(fid,1), numSamples);
+Nk   = floor(max(traj)) + 1;                         % regridded size
+cen  = Param.EpiReadCenterPV;                        % index of k = 0 (PVM_EpiReadCenter)
+if isempty(cen), cen = floor((Nk-1)/2); end          % e.g. PV6 (no PVM_EpiReadCenter)
+keven = (0:Nk-1) - cen;                              % evenly spaced k-space locations
+Ne    = numel(keven);
 
-reconx.encodeNx_  = maxK; %Param.Matrix(1); % hdr.encoding.encodedSpace.matrixSize.x;
-reconx.encodeFOV_ = Param.FoV(1); %hdr.encoding.encodedSpace.fieldOfView_mm.x;
-reconx.reconNx_   = Param.Matrix(1); % hdr.encoding.reconSpace.matrixSize.x;
-reconx.reconFOV_  = Param.FoV(1); %hdr.encoding.reconSpace.fieldOfView_mm.x;
+D  = traj.' - (0:Nk-1).';                            % [Nk x numSamples]: k_t - j
+Kc = sinc(D) .* (abs(D)<5) .* cos(pi*D/10).^2 .* gradient(traj).';
 
-trajectoryPos_ = (Param.EpiTrajAdjkxSodd'-max(abs(Param.EpiTrajAdjkxSodd/2)));
-trajectoryNeg_ = (Param.EpiTrajAdjkxSeven'-(trajectoryPos_(end)));
-reconx.numSamples_ = Param.EncMatrix(1);
+b0 = Param.EpiTrajAdjb0(:);
+if isempty(b0), b0 = zeros(numSamples,1); end
+pQp = Kc .* exp(-1i*b0).';                           % positive echoes
+pQn = Kc(end:-1:1,:) .* exp(1i*(b0 - b0(end))).';    % negative echoes: same regrid, then REV
 
-% Compute the reconstruction operator
-Km = floor(reconx.encodeNx_ / 2.0);
-Ne = 2*Km + 1;
+% Image-domain positions = Paravision grid, in units of the encoded FOV:
+% RecoZfill to RECO_ft_size, RecoFTShift with RECO_rotate, RecoFT (exponent +1),
+% RecoCutoff with RECO_offset / RECO_size  ->  x = ((0:RECO_size-1)+RECO_offset)/RECO_ft_size - RECO_rotate
+% This includes the centring (RECO_rotate=0.5), the read off-centre and the anti-alias crop.
+% One grid per frame (2D: slices in raw acquisition order, dim 4 of fid).
+nFrames = size(Param.RecoRotate,2);
+Nout    = Param.RecoSize(1);
+fftscale = 1.0 / Param.RecoFtSize(1);               % Paravision: zero filling to RECO_ft_size + inverse FT normalised by 1/N
 
-% resize the reconstruction operator
-Mpos_=zeros(reconx.reconNx_,reconx.numSamples_);
-Mneg_=zeros(reconx.reconNx_,reconx.numSamples_);
+sz = size(fid); sz(end+1:max([polDim,2,4,7])) = 1;   % receivers are in dim 7
+assert(sz(polDim)==2, 'Polarity dimension %d must have size 2 (pos/neg)', polDim);
+assert(nFrames==1 || sz(4)==nFrames, 'RECO_rotate has %d frames but fid dim 4 has %d', nFrames, sz(4));
 
-% evenly spaced k-space locations
-keven = linspace(-Km, Km, Ne);
-%keven.print("keven =");
-
-% image domain locations [-0.5,...,0.5)
-x = linspace(-0.5,(reconx.reconNx_-1.)/(2.*reconx.reconNx_),reconx.reconNx_);
-x = x./Param.AntiAlias(1);
-%x.print("x =");
-
-% DFT operator
-% Going from k space to image space, we use the IFFT sign convention
-F=zeros(reconx.reconNx_, Ne);
-fftscale = 1.0 / sqrt(Ne);
-
-for p=1:1:reconx.reconNx_
-    for q=1:1:Ne
-        F(p,q) = fftscale * exp(complex(0.0,1.0*2*pi*keven(q)*x(p)));
-    end
-end
-%F.print("F =");
-
-% forward operators
-Qp=zeros(reconx.numSamples_, Ne);
-Qn=zeros(reconx.numSamples_, Ne);
-
-for p=1:1:reconx.numSamples_
-    %GDEBUG_STREAM(trajectoryPos_(p) << "    " << trajectoryNeg_(p) << std::endl);
-    for q=1:1:Ne
-        Qp(p,q) = sinc(trajectoryPos_(p)-keven(q));
-        Qn(p,q) = sinc(trajectoryNeg_(p)-keven(q));
-    end
+% Ghost correction (Paravision RecoEpiGhostFilter, not used with double sampling):
+% PVM_EpiPhaseCorrection(receiver, [2*frame-1, 2*frame]) = [ph0 ph1] (frames in acquisition order).
+% Negative echoes get the relative phase ph0 - ph1*n, n = x*RECO_ft_size (read pixel, 0 at the centre).
+ghost = strcmp(Param.DoubleSampling,'no') && ~isempty(Param.EpiPhaseCorrection);
+if ghost
+    assert(size(Param.EpiPhaseCorrection,2) >= 2*nFrames, 'PVM_EpiPhaseCorrection has %d values per receiver, expected %d', size(Param.EpiPhaseCorrection,2), 2*nFrames);
 end
 
-%Qp.print("Qp =");
-%Qn.print("Qn =");
-% figure(1)
-% subplot(2,2,1)
-% imagesc(Qp)
-% subplot(2,2,2)
-% imagesc(Qn)
-% subplot(2,2,3)
-% plot(trajectoryNeg_)
-% subplot(2,2,4)
-% plot(trajectoryPos_)
-
-% recon operators
-Mp=zeros(reconx.reconNx_,reconx.numSamples_);
-Mn=zeros(reconx.reconNx_,reconx.numSamples_);
-Mp = F * pinv(Qp);
-Mn = F * pinv(Qn);
-
-% Compute the off-center correction:     /////
-
-% Compute the off-center distance in the RO direction:
-% roOffCenterDistance = calcOffCenterDistance( hdr_in );
-roOffCenterDistance =Param.Read_offset; % is unit OK ?
-%GDEBUG_STREAM("roOffCenterDistance_: " << roOffCenterDistance << ";       encodeFOV_: " << encodeFOV_);
-
-my_keven = linspace(0, reconx.numSamples_ -1, reconx.numSamples_);
-%         % find the offset:
-%         % PV: maybe find not just exactly 0, but a very small number?
-trajectoryPosArma = trajectoryPos_;
-
-% n = find( trajectoryPosArma==0, 1, 'first');
-[~,n] = min(abs(trajectoryPosArma));
-
-my_keven = my_keven - (n-1);  %%attention 128
-
-% my_keven
-%         % Scale it:
-%         % We have to find the maximum k-trajectory (absolute) increment:
-Delta_k = abs( trajectoryPosArma(2:reconx.numSamples_,1) - trajectoryPosArma(1:reconx.numSamples_-1,1));
-% max(Delta_k(:))
-
-my_keven = my_keven *max(Delta_k(:));
-%
-%         % off-center corrections:
-
-
-clear offCenterCorrN offCenterCorrP
-
-myExponent = zeros(reconx.numSamples_,1);
-
-
-for l=1:size(trajectoryPosArma,1)
-    myExponent(l,1)=imag( 2*pi*roOffCenterDistance/reconx.encodeFOV_*(trajectoryPosArma(l,1)-my_keven(1,l)) );
-end
-
-offCenterCorrN = exp( myExponent );
-
-for l=1:size(trajectoryPosArma,1)
-    myExponent(l,1)=imag( 2*pi*roOffCenterDistance/reconx.encodeFOV_*(trajectoryNeg_(l,1)+my_keven(1,l)) );
-end
-
-offCenterCorrP = exp( myExponent );
-
-%         Finally, combine the off-center correction with the recon operator:
-Mp = Mp * diag(offCenterCorrP);
-Mn = Mn * diag(offCenterCorrN);
-
-%          and save it into the NDArray members:
-for p=1:1:reconx.reconNx_
-    for q=1:1:reconx.numSamples_
-        Mpos_(p,q) = Mp(p,q);
-        Mneg_(p,q) = Mn(p,q);
-    end
-end
-
-fidR = zeros(Param.Matrix(1),size(fid,2),size(fid,3),size(fid,4),size(fid,5),size(fid,6),size(fid,7));
-for dim2 =1:size(fid,2)
-    for dim3 =1:size(fid,3)
-        for dim4 =1:size(fid,4)
-            for dim6 =1:size(fid,6)
-                for dim7 =1:size(fid,7)
-                    fidR(:,dim2,dim3,dim4,1,dim6,dim7) = Mpos_*squeeze(fid(:,dim2,dim3,dim4,1,dim6,dim7));
-                    fidR(:,dim2,dim3,dim4,2,dim6,dim7) = Mneg_*squeeze(fid(:,dim2,dim3,dim4,2,dim6,dim7));
-                end
-            end
+fidR = zeros([Nout sz(2:end)]);
+idx  = repmat({':'}, 1, numel(sz));
+for f = 1:nFrames
+    x = ((0:Nout-1).' + Param.RecoOffset(1,f))/Param.RecoFtSize(1) - Param.RecoRotate(1,f);
+    F = fftscale*exp(1i*2*pi*x*keven);      % DFT operator, inverse-FT sign convention (as Paravision)
+    if nFrames > 1, idx{4} = f; end
+    for r = 1:sz(7)
+        if ghost
+            row = min(r, size(Param.EpiPhaseCorrection,1));
+            ph  = Param.EpiPhaseCorrection(row, 2*f-1:2*f);          % [ph0 ph1]
+            gN  = exp(1i*(ph(1) - ph(2)*x*Param.RecoFtSize(1)));     % ghost correction, negative echoes
+        else
+            gN  = 1;
+        end
+        M = {F*pQp, (gN.*F)*pQn};           % recon operators, positive / negative readout
+        idx{7} = r;
+        for pol = 1:2
+            idx{polDim} = pol;
+            A   = fid(idx{:});
+            szA = size(A); szA(end+1:numel(sz)) = 1;
+            fidR(idx{:}) = reshape(M{pol} * reshape(A, sz(1), []), [Nout szA(2:end)]);
         end
     end
 end
 
-fidR = fftshift(fft(fftshift(fidR,1),[],1),1);
+fidR = fftshift(fft(fftshift(fidR,1),[],1),1);   % back to k-space (inverted exactly before display)
 end

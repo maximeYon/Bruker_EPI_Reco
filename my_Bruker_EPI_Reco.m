@@ -9,9 +9,9 @@ clearvars; close all; clc;
 
 home_path = pwd; home_path = split(home_path,filesep);
 home_path = join(home_path(1:end-1,1),filesep,1); home_path = home_path{1};
-% addpath(genpath('functions'));
-addpath('functions');
-addpath(genpath('pvtools'));
+
+addpath(genpath('functions'));
+
 
 %% Data path
 % expno_dir = 'C:\Users\User\Mon_Drive\Matlab\ProcessingPV360\data\EPI_test\9\';

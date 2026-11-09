@@ -122,6 +122,22 @@ else
     pValStr=dataParsFiles(a:b);
 end
 
+%%PV360 fix the @ values in pValStr
+indAT=strfind(pValStr,'@');
+while isempty(indAT)==0
+    indEND = strfind(pValStr(1,indAT(1,1):end),')');
+    ATparFull = pValStr(indAT(1,1):indAT(1,1)+indEND(1,1)-1);
+    ATpar = pValStr(indAT(1)+1:indAT(1,1)+indEND(1)-2);
+    ATpar = regexprep(ATpar,'*(',' ');
+    ParNumVal=str2num(ATpar);
+    ReplacePar = num2str(ones(1,ParNumVal(1,1))*ParNumVal(1,2));
+    ReplacePar = [ReplacePar, ' '];
+    ATparFull = regexptranslate('escape',ATparFull);
+    pValStr = regexprep(pValStr,ATparFull,ReplacePar);
+    indAT=strfind(pValStr,'@');
+end
+% End of PV360 fix the @ values in pValStr
+
 %try converting to numeric
 pValNum=str2num(pValStr);
 if(isnumeric(sum(pValNum)) && ~isempty(pValNum))
